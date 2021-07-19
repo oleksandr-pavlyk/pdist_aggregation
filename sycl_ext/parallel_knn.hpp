@@ -79,7 +79,7 @@ void parallel_knn_search(
     const size_t test_chunk_size = std::max(n_test_, size_t(512));
 
     sycl::buffer<floatT, 2> dist_buf(
-        sycl::range<2>(train_chunk_size, test_chunk_size));
+        sycl::range<2>(test_chunk_size, train_chunk_size));
     sycl::buffer<pair_t, 2> aggregation_heap_buf(sycl::range<2>(test_chunk_size, k));
 
     const size_t n_train_chunks = ceiling_quotient(n_train_, train_chunk_size);
@@ -171,7 +171,7 @@ void parallel_knn_search(
                                     floatT,
                                     sycl::ONEAPI::memory_order::relaxed,
                                     sycl::ONEAPI::memory_scope::device,
-                                    sycl::access::address_space::global_space>(dist_acc[sycl::id<2>(i_train, i_test)]);
+                                    sycl::access::address_space::global_space>(dist_acc[sycl::id<2>(i_test, i_train)]);
                                 dij.fetch_add(scratch[0]);
                             }
                         });
@@ -216,7 +216,7 @@ void parallel_knn_search(
                                 pair_t top = max_heap_acc[sycl::id<3>(test_id, heap_id, 0)];
                                 pair_t cand;
                                 size_t abs_i_train = n_train_disp + i_train;
-                                floatT dist_itrain_to_testid = dist_acc[sycl::id<2>(i_train, test_id)];
+                                floatT dist_itrain_to_testid = dist_acc[sycl::id<2>(test_id, i_train)];
                                 cand.set(dist_itrain_to_testid, abs_i_train);
                                 if (comp(cand, top))
                                 {
