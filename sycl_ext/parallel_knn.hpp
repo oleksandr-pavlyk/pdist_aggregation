@@ -75,7 +75,7 @@ void parallel_knn_search(
         return p1.get_distance() < p2.get_distance();
     };
 
-    const size_t train_chunk_size = std::min(n_train_, std::max(k, size_t(4096)));
+    const size_t train_chunk_size = std::min(n_train_, std::max(k, size_t(16536)));
     const size_t test_chunk_size = std::max(n_test_, size_t(512));
 
     sycl::buffer<floatT, 2> dist_buf(
@@ -124,7 +124,7 @@ void parallel_knn_search(
             sycl::event pw_dist_ev = exec_q.submit(
                 [&](sycl::handler &cgh)
                 {
-                    int dim_chunk = 16;
+                    int dim_chunk = 8;
                     assert(0 == (dim_chunk & (dim_chunk - 1)));
                     cgh.depends_on(depends);
                     cgh.depends_on(prev_iter_dep);
