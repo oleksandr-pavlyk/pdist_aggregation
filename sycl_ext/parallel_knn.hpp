@@ -194,8 +194,7 @@ void parallel_knn_search(
                         {
                             auto heap_id = it.get_id(0);
                             auto test_id = it.get_id(1);
-                            auto distances_chunk = ceiling_quotient(n_train, m);
-                            const auto comp = [](pair_t p1, pair_t p2)
+                            const auto device_comp = [](pair_t p1, pair_t p2)
                             {
                                 return p1.get_distance() < p2.get_distance();
                             };
@@ -208,28 +207,25 @@ void parallel_knn_search(
                                 max_heap_acc[sycl::id<3>(test_id, heap_id, elem_id)] = pair_t();
                             }
 
-                            size_t count = 0;
-                            for (size_t i_train = heap_id * distances_chunk;
-                                 (i_train < n_train) && (count < distances_chunk);
-                                 ++count, ++i_train)
+                            for (size_t i_train = heap_id; i_train < n_train; i_train += m)
                             {
                                 pair_t top = max_heap_acc[sycl::id<3>(test_id, heap_id, 0)];
                                 pair_t cand;
                                 size_t abs_i_train = n_train_disp + i_train;
                                 floatT dist_itrain_to_testid = dist_acc[sycl::id<2>(test_id, i_train)];
                                 cand.set(dist_itrain_to_testid, abs_i_train);
-                                if (comp(cand, top))
+                                if (device_comp(cand, top))
                                 {
                                     // proxy to represent view with fixed index 0, and index 1.
                                     HeapProxy3D<decltype(max_heap_acc)> heap(max_heap_acc, test_id, heap_id);
 
                                     // no synchronization is needed, since workitems
                                     // work on disjoint blocks of memory
-                                    pop_heap<decltype(heap), pair_t, decltype(comp)>(
-                                        heap, k, comp);
+                                    pop_heap<decltype(heap), pair_t, decltype(device_comp)>(
+                                        heap, k, device_comp);
                                     heap[k - 1] = cand;
-                                    push_heap<decltype(heap), pair_t, decltype(comp)>(
-                                        heap, k, comp);
+                                    push_heap<decltype(heap), pair_t, decltype(device_comp)>(
+                                        heap, k, device_comp);
                                 }
                             }
                         });
