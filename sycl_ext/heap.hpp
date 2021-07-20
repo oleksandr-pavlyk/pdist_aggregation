@@ -1,3 +1,15 @@
+/*
+ The code below was adapated from oneAPI sources
+ in ${ONEAPI_ROOT}/dpl/latest/linux/include/oneapi/dpl/pstl/ranges/nanorange.hpp
+
+ where it is attributed to
+
+ Copyright (c) 2018 Tristan Brindle (tcbrindle at gmail dot com)
+ Distributed under the Boost Software License, Version 1.0. (See accompanying
+ file LICENSE_1_0.txt or copy at http://www.boost.org/LICENSE_1_0.txt)
+
+ */
+
 #pragma once
 
 // Heap internal structure is 0-based array of n-elements
