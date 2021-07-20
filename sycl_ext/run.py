@@ -46,7 +46,7 @@ print("SYCL algo on CPU computation took {} seconds".format(t3-t2))
 
 
 print("")
-print("Repeating SYCL algo runs (JIT-ting has already happenned)")
+print("Repeating SYCL algo runs (JIT-ting has already happened)")
 t1 = default_timer()
 ind_gpu = knn_gpu.kneighbors(X_test)
 t2 = default_timer()
