@@ -70,7 +70,7 @@ void parallel_knn_search(
     const sycl::vector_class<sycl::event> &depends = {})
 {
     using pair_t = DistanceIndex<floatT, intT>;
-    auto comp = [](pair_t p1, pair_t p2)
+    auto host_comp = [](pair_t p1, pair_t p2)
     {
         return p1.get_distance() < p2.get_distance();
     };
@@ -88,12 +88,17 @@ void parallel_knn_search(
     sycl::buffer<floatT, 1> X_train_buf(X_train_ptr, dim * n_train_, {sycl::property::buffer::use_host_ptr()});
     sycl::buffer<floatT, 1> X_test_buf(X_test_ptr, dim * n_test_, {sycl::property::buffer::use_host_ptr()});
 
+    // to find nearest neighbors, (n_test, n_heaps_per_test) heaps are maintained,
+    // each heap is built by a work-item, based on (n_train / m) distances
+    size_t n_heaps_per_test = std::min(size_t(16), ceiling_quotient(train_chunk_size, 16 * k));
+    sycl::buffer<pair_t, 3> max_heap_buf(sycl::range<3>(n_test_, n_heaps_per_test, k));
+
     for (size_t n_test_chunk_id = 0; n_test_chunk_id < n_test_chunks; ++n_test_chunk_id)
     {
         size_t n_test_disp = n_test_chunk_id * test_chunk_size;
         size_t n_test = ((n_test_disp + test_chunk_size) < n_test_) ? test_chunk_size : (n_test_ - n_test_disp);
 
-        exec_q.submit(
+        sycl::event init_aggregation_heap_ev = exec_q.submit(
             [&](sycl::handler &cgh)
             {
                 sycl::accessor aggregation_heap_acc(aggregation_heap_buf, cgh);
@@ -105,12 +110,25 @@ void parallel_knn_search(
                     });
             });
 
-        sycl::event prev_iter_dep{};
+        sycl::event init_max_heap_ev = exec_q.submit(
+            [&](sycl::handler &cgh)
+            {
+                sycl::accessor max_heap_acc(max_heap_buf, cgh, sycl::write_only, sycl::noinit);
+                cgh.parallel_for(
+                    sycl::range<3>(n_test, n_heaps_per_test, k),
+                    [=](sycl::item<3> it)
+                    {
+                        max_heap_acc[it.get_id()] = pair_t();
+                    });
+            });
+
+        sycl::event prev_iter_dep = init_max_heap_ev;
 
         for (size_t n_train_chunk_id = 0; n_train_chunk_id < n_train_chunks; ++n_train_chunk_id)
         {
             size_t n_train_disp = n_train_chunk_id * train_chunk_size;
             size_t n_train = (n_train_disp + train_chunk_size < n_train_) ? train_chunk_size : (n_train_ - n_train_disp);
+
             // no need to track the returned event,
             // as dependency is handled via accessors
             exec_q.submit(
@@ -177,11 +195,7 @@ void parallel_knn_search(
                         });
                 });
 
-            // to find nearest neighbors, (n_train, m) heaps are maintained,
-            // each heap is built by a work-item, based on (n_train / m) distances
             size_t m = std::min(size_t(16), ceiling_quotient(n_train, 16 * k));
-            sycl::buffer<pair_t, 3> max_heap_buf(sycl::range<3>(n_test, m, k));
-
             sycl::event topk_ev = exec_q.submit(
                 [&](sycl::handler &cgh)
                 {
@@ -198,14 +212,6 @@ void parallel_knn_search(
                             {
                                 return p1.get_distance() < p2.get_distance();
                             };
-
-                            // initialize the heap
-                            for (size_t elem_id = 0; elem_id < k; ++elem_id)
-                            {
-                                // has heap structure by construction at
-                                // initialization (all distances +inf, all indices -1)
-                                max_heap_acc[sycl::id<3>(test_id, heap_id, elem_id)] = pair_t();
-                            }
 
                             for (size_t i_train = heap_id; i_train < n_train; i_train += m)
                             {
@@ -232,43 +238,35 @@ void parallel_knn_search(
                 });
             prev_iter_dep = topk_ev;
 
-            // we now have m heaps, for the each test point in the chunk
-            // we aggregate these heaps into aggregation heap on the host.
-            {
-                sycl::host_accessor max_heap_hacc(max_heap_buf, sycl::read_only);
-                sycl::host_accessor aggregation_heap_hacc(aggregation_heap_buf);
+        } // end of loop over training vectors
 
-                for (size_t i_test = 0; i_test < n_test; ++i_test)
+        // we now have m heaps, for the each test point in the chunk
+        // we aggregate these heaps into aggregation heap on the host.
+        {
+            sycl::host_accessor max_heap_hacc(max_heap_buf, sycl::read_only);
+            sycl::host_accessor aggregation_heap_hacc(aggregation_heap_buf);
+
+            for (size_t i_test = 0; i_test < n_test; ++i_test)
+            {
+                HeapProxy2D<decltype(aggregation_heap_hacc)> res_heap(aggregation_heap_hacc, i_test);
+                for (size_t heap_chunk_id = 0; heap_chunk_id < n_heaps_per_test; ++heap_chunk_id)
                 {
-                    HeapProxy2D<decltype(aggregation_heap_hacc)> res_heap(aggregation_heap_hacc, i_test);
-                    for (size_t heap_chunk_id = 0; heap_chunk_id < m; ++heap_chunk_id)
+                    for (size_t heap_elem_id = 0; heap_elem_id < k; ++heap_elem_id)
                     {
-                        for (size_t heap_elem_id = 0; heap_elem_id < k; ++heap_elem_id)
+                        pair_t top = res_heap[0];
+                        pair_t cand = max_heap_hacc[sycl::id<3>(i_test, heap_chunk_id, heap_elem_id)];
+                        if (host_comp(cand, top))
                         {
-                            pair_t top = res_heap[0];
-                            pair_t cand = max_heap_hacc[sycl::id<3>(i_test, heap_chunk_id, heap_elem_id)];
-                            if (comp(cand, top))
-                            {
-                                pop_heap<decltype(res_heap), pair_t, decltype(comp)>(
-                                    res_heap, k, comp);
-                                res_heap[k - 1] = cand;
-                                push_heap<decltype(res_heap), pair_t, decltype(comp)>(
-                                    res_heap, k, comp);
-                            }
+                            pop_heap<decltype(res_heap), pair_t, decltype(host_comp)>(
+                                res_heap, k, host_comp);
+                            res_heap[k - 1] = cand;
+                            push_heap<decltype(res_heap), pair_t, decltype(host_comp)>(
+                                res_heap, k, host_comp);
                         }
                     }
                 }
-            }
-        } // end of loop over training vectors
-
-        {
-            sycl::host_accessor aggregation_heap_hacc(aggregation_heap_buf);
-            for (size_t i_test = 0; i_test < n_test; ++i_test)
-            {
-
                 size_t abs_i_test = n_test_disp + i_test;
-                HeapProxy2D<decltype(aggregation_heap_hacc)> res_heap(aggregation_heap_hacc, i_test);
-                sort_heap<decltype(res_heap), pair_t, decltype(comp)>(res_heap, k, comp);
+                sort_heap<decltype(res_heap), pair_t, decltype(host_comp)>(res_heap, k, host_comp);
                 // res_heap is now sorted, from least distance to k-th largest one
                 floatT prev = -std::numeric_limits<floatT>::infinity();
                 for (size_t i = 0; i < k; ++i)
