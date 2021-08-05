@@ -56,6 +56,11 @@ inline T ceiling_quotient(T n, T m)
     return ((n + m - 1) / m);
 }
 
+class kern_init_aggregation_heap;
+class kern_init_max_heap;
+class kern_pwdist;
+class kern4;
+
 template <typename floatT, typename intT>
 void parallel_knn_search(
     sycl::queue &exec_q,
@@ -102,7 +107,7 @@ void parallel_knn_search(
             [&](sycl::handler &cgh)
             {
                 sycl::accessor aggregation_heap_acc(aggregation_heap_buf, cgh);
-                cgh.parallel_for(
+                cgh.parallel_for<kern_init_aggregation_heap>(
                     sycl::range<2>(n_test, k),
                     [=](sycl::item<2> it)
                     {
@@ -114,7 +119,7 @@ void parallel_knn_search(
             [&](sycl::handler &cgh)
             {
                 sycl::accessor max_heap_acc(max_heap_buf, cgh, sycl::write_only, sycl::noinit);
-                cgh.parallel_for(
+                cgh.parallel_for<kern_init_max_heap>(
                     sycl::range<3>(n_test, n_heaps_per_test, k),
                     [=](sycl::item<3> it)
                     {
@@ -153,7 +158,7 @@ void parallel_knn_search(
                     sycl::accessor X_train_acc(X_train_buf, cgh, sycl::read_only);
                     sycl::accessor X_test_acc(X_test_buf, cgh, sycl::read_only);
 
-                    cgh.parallel_for(
+                    cgh.parallel_for<kern_pwdist>(
                         sycl::nd_range<3>(
                             sycl::range<3>(dim_chunk * ceiling_quotient<size_t>(dim, dim_chunk), n_train, n_test),
                             sycl::range<3>(dim_chunk, 1, 1)),
@@ -202,7 +207,7 @@ void parallel_knn_search(
                     cgh.depends_on(pw_dist_ev);
                     sycl::accessor max_heap_acc(max_heap_buf, cgh);
                     sycl::accessor dist_acc(dist_buf, cgh, sycl::read_only);
-                    cgh.parallel_for(
+                    cgh.parallel_for<kern4>(
                         sycl::range<2>(m, n_test),
                         [=](sycl::item<2> it)
                         {
