@@ -36,6 +36,6 @@ SYCL algo on CPU computation took 8.878650922793895 seconds
 cd sycl_ext
 # activate DPC++ compiler
 . /opt/intel/oneapi/compiler/latest/env/vars.sh
-CC=clang SYCL=dpcpp python setup.py build_ext --inplace
+CC=clang CXX=dpcpp python setup.py build_ext --inplace
 python run.py
 ```
