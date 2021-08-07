@@ -1,6 +1,7 @@
 #include <CL/sycl.hpp>
 #include <limits>
 #include <random>
+#include <chrono>
 #include "heap.hpp"
 #include "parallel_knn.hpp"
 
@@ -42,6 +43,12 @@ int main(void)
     parallel_knn_search<double, long long>(q, k, dim, X_train_host, n_train, X_test_host, n_test, knn_ind, knn_dists, {});
     q.wait();
     auto t1 = std::chrono::steady_clock::now();
+    std::cout << "Elapsed parallel_knn wall-time: " << elapsed(t0, t1) << " microseconds." << std::endl;
+
+    t0 = std::chrono::steady_clock::now();
+    parallel_knn_search<double, long long>(q, k, dim, X_train_host, n_train, X_test_host, n_test, knn_ind, knn_dists, {});
+    q.wait();
+    t1 = std::chrono::steady_clock::now();
     std::cout << "Elapsed parallel_knn wall-time: " << elapsed(t0, t1) << " microseconds." << std::endl;
 
     std::cout

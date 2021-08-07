@@ -59,7 +59,121 @@ inline T ceiling_quotient(T n, T m)
 class kern_init_aggregation_heap;
 class kern_init_max_heap;
 class kern_pwdist;
-class kern4;
+class topk_kern;
+
+template <typename floatT, int dim_chunk = 2, int n_train_chunk = 16, int n_test_chunk = 8>
+sycl::event compute_pw_dist_opt(
+    sycl::queue &exec_q,
+    size_t dim,
+    sycl::buffer<floatT, 1> &X_train_buf,
+    size_t n_train,
+    sycl::buffer<floatT, 1> &X_test_buf,
+    size_t n_test,
+    sycl::buffer<floatT, 2> &dist_buf,
+    const sycl::event &prev_iter_dep,
+    const sycl::vector_class<sycl::event> depends = {})
+{
+    static_assert(0 == (dim_chunk & (dim_chunk - 1)));
+    static_assert(dim_chunk == 2 || dim_chunk == 4 || dim_chunk == 8);
+    static_assert(n_test_chunk > 0);
+    static_assert(n_train_chunk > 0);
+    static_assert(0 == (n_test_chunk & (n_test_chunk - 1)));
+    static_assert(0 == (n_train_chunk & (n_train_chunk - 1)));
+
+    sycl::event ev =
+        exec_q.submit(
+            [&](sycl::handler &cgh)
+            {
+                cgh.depends_on(depends);
+                cgh.depends_on(prev_iter_dep);
+                sycl::accessor<floatT, 3, sycl::access::mode::read_write, sycl::access::target::local>
+                    scratch(sycl::range<3>(n_train_chunk, n_test_chunk, dim_chunk), cgh);
+                sycl::accessor dist_acc(dist_buf, cgh, sycl::read_write);
+                sycl::accessor X_train_acc(X_train_buf, cgh, sycl::read_only);
+                sycl::accessor X_test_acc(X_test_buf, cgh, sycl::read_only);
+
+                auto ndRange = sycl::nd_range<3>(
+                    sycl::range<3>(
+                        n_train_chunk * ceiling_quotient(n_train, static_cast<size_t>(n_train_chunk)),
+                        n_test_chunk * ceiling_quotient(n_test, static_cast<size_t>(n_test_chunk)),
+                        dim_chunk),
+                    sycl::range<3>(n_train_chunk, n_test_chunk, dim_chunk));
+                auto kern_func = [=](sycl::nd_item<3> it)
+                {
+                    auto i_train = it.get_global_id(0);
+                    auto lid_train = it.get_local_id(0);
+                    auto i_test = it.get_global_id(1);
+                    auto lid_test = it.get_local_id(1);
+                    auto lid = it.get_local_id(2);
+
+                    if ((lid < dim) && (i_train < n_train) && (i_test < n_test))
+                    {
+                        floatT sum_sq(0);
+                        for (size_t k = lid; k < dim; k += dim_chunk)
+                        {
+                            const floatT diff = (X_train_acc[i_train * dim + k] -
+                                                 X_test_acc[i_test * dim + k]);
+                            sum_sq += diff * diff;
+                        }
+                        scratch[sycl::id<3>(lid_train, lid_test, lid)] = sum_sq;
+                    }
+                    else
+                    {
+                        scratch[sycl::id<3>(lid_train, lid_test, lid)] = floatT(0);
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+                    if constexpr (dim_chunk == 2)
+                    {
+                        int i = dim_chunk >> 1;
+                        if (lid < static_cast<decltype(lid)>(i))
+                            scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    else if constexpr (dim_chunk == 4)
+                    {
+                        int i = dim_chunk >> 1;
+                        if (lid < static_cast<decltype(lid)>(i))
+                            scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                        it.barrier(sycl::access::fence_space::local_space);
+                        i = dim_chunk >> 2;
+                        if (lid < static_cast<decltype(lid)>(i))
+                            scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    else if constexpr (dim_chunk == 8)
+                    {
+                        int i = dim_chunk >> 1;
+                        if (lid < static_cast<decltype(lid)>(i))
+                            scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                        it.barrier(sycl::access::fence_space::local_space);
+                        i = dim_chunk >> 2;
+                        if (lid < static_cast<decltype(lid)>(i))
+                            scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                        it.barrier(sycl::access::fence_space::local_space);
+                        i = dim_chunk >> 3;
+                        if (lid < static_cast<decltype(lid)>(i))
+                            scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                        it.barrier(sycl::access::fence_space::local_space);
+                    }
+                    else
+                    {
+                        for (int i = dim_chunk / 2; i > 0; i >>= 1)
+                        {
+                            if (lid < static_cast<decltype(lid)>(i))
+                                scratch[sycl::id<3>(lid_train, lid_test, lid)] += scratch[sycl::id<3>(lid_train, lid_test, lid + i)];
+                            it.barrier(sycl::access::fence_space::local_space);
+                        }
+                    }
+                    if (lid == 0 && (i_test < n_test) && (i_train < n_train))
+                    {
+                        dist_acc[sycl::id<2>(i_test, i_train)] = scratch[sycl::id<3>(lid_train, lid_test, 0)];
+                    }
+                };
+                cgh.parallel_for<class kern_pwdist>(ndRange, kern_func);
+            });
+
+    return ev;
+}
 
 template <typename floatT, typename intT>
 void parallel_knn_search(
@@ -103,6 +217,8 @@ void parallel_knn_search(
         size_t n_test_disp = n_test_chunk_id * test_chunk_size;
         size_t n_test = ((n_test_disp + test_chunk_size) < n_test_) ? test_chunk_size : (n_test_ - n_test_disp);
 
+        auto X_test_chunk_buf = sycl::buffer(X_test_buf, sycl::id<1>(n_test_disp * dim), sycl::range<1>(n_test * dim));
+
         sycl::event init_aggregation_heap_ev = exec_q.submit(
             [&](sycl::handler &cgh)
             {
@@ -134,6 +250,8 @@ void parallel_knn_search(
             size_t n_train_disp = n_train_chunk_id * train_chunk_size;
             size_t n_train = (n_train_disp + train_chunk_size < n_train_) ? train_chunk_size : (n_train_ - n_train_disp);
 
+            auto X_train_chunk_buf = sycl::buffer(X_train_buf, sycl::id<1>(n_train_disp * dim), sycl::range<1>(n_train * dim));
+
             // no need to track the returned event,
             // as dependency is handled via accessors
             exec_q.submit(
@@ -144,61 +262,11 @@ void parallel_knn_search(
                     cgh.fill<floatT>(dist_acc, floatT(0));
                 });
 
-            sycl::event pw_dist_ev = exec_q.submit(
-                [&](sycl::handler &cgh)
-                {
-                    int dim_chunk = 8;
-                    assert(0 == (dim_chunk & (dim_chunk - 1)));
-                    cgh.depends_on(depends);
-                    cgh.depends_on(prev_iter_dep);
-
-                    sycl::accessor dist_acc(dist_buf, cgh, sycl::read_write);
-                    sycl::accessor<floatT, 1, sycl::access::mode::read_write, sycl::access::target::local>
-                        scratch(dim_chunk, cgh);
-                    sycl::accessor X_train_acc(X_train_buf, cgh, sycl::read_only);
-                    sycl::accessor X_test_acc(X_test_buf, cgh, sycl::read_only);
-
-                    cgh.parallel_for<kern_pwdist>(
-                        sycl::nd_range<3>(
-                            sycl::range<3>(dim_chunk * ceiling_quotient<size_t>(dim, dim_chunk), n_train, n_test),
-                            sycl::range<3>(dim_chunk, 1, 1)),
-                        [=](sycl::nd_item<3> it)
-                        {
-                            auto gid = it.get_global_id(0);
-                            auto lid = it.get_local_id(0);
-                            auto i_train = it.get_global_id(1);
-                            auto i_test = it.get_global_id(2);
-
-                            if (gid < dim)
-                            {
-                                size_t abs_i_train = n_train_disp + i_train;
-                                size_t abs_i_test = n_test_disp + i_test;
-                                const floatT diff = (X_train_acc[abs_i_train * dim + gid] -
-                                                     X_test_acc[abs_i_test * dim + gid]);
-                                scratch[lid] = diff * diff;
-                            }
-                            else
-                            {
-                                scratch[lid] = floatT(0);
-                            }
-                            for (int i = dim_chunk / 2; i > 0; i >>= 1)
-                            {
-                                it.barrier(sycl::access::fence_space::local_space);
-                                if (lid < static_cast<decltype(lid)>(i))
-                                    scratch[lid] += scratch[lid + i];
-                            }
-                            it.barrier(sycl::access::fence_space::local_space);
-                            if (lid == 0)
-                            {
-                                auto dij = sycl::ONEAPI::atomic_ref<
-                                    floatT,
-                                    sycl::ONEAPI::memory_order::relaxed,
-                                    sycl::ONEAPI::memory_scope::device,
-                                    sycl::access::address_space::global_space>(dist_acc[sycl::id<2>(i_test, i_train)]);
-                                dij.fetch_add(scratch[0]);
-                            }
-                        });
-                });
+            sycl::event pw_dist_ev = compute_pw_dist_opt<floatT>(
+                exec_q, dim,
+                X_train_chunk_buf, n_train,
+                X_test_chunk_buf, n_test,
+                dist_buf, prev_iter_dep, depends);
 
             size_t m = std::min(size_t(16), ceiling_quotient(n_train, 16 * k));
             sycl::event topk_ev = exec_q.submit(
@@ -207,7 +275,7 @@ void parallel_knn_search(
                     cgh.depends_on(pw_dist_ev);
                     sycl::accessor max_heap_acc(max_heap_buf, cgh);
                     sycl::accessor dist_acc(dist_buf, cgh, sycl::read_only);
-                    cgh.parallel_for<kern4>(
+                    cgh.parallel_for<topk_kern>(
                         sycl::range<2>(m, n_test),
                         [=](sycl::item<2> it)
                         {
