@@ -77,7 +77,9 @@ inline intT int_sqrt(intT n)
 class kern_init_aggregation_heap;
 class kern_init_max_heap;
 class kern_pwdist;
+class kern_pwdist2;
 class kern_topk;
+class kern_aggregate;
 
 template <typename floatT, int dim_chunk = 2, int n_train_chunk = 16, int n_test_chunk = 8>
 sycl::event compute_pw_dist_opt(
@@ -92,11 +94,12 @@ sycl::event compute_pw_dist_opt(
     const sycl::vector_class<sycl::event> depends = {})
 {
     static_assert(0 == (dim_chunk & (dim_chunk - 1)));
+    static_assert(0 == (n_test_chunk & (n_test_chunk - 1)));
+    static_assert(0 == (n_train_chunk & (n_train_chunk - 1)));
+
     static_assert(dim_chunk == 2 || dim_chunk == 4 || dim_chunk == 8);
     static_assert(n_test_chunk > 0);
     static_assert(n_train_chunk > 0);
-    static_assert(0 == (n_test_chunk & (n_test_chunk - 1)));
-    static_assert(0 == (n_train_chunk & (n_train_chunk - 1)));
 
     sycl::event ev =
         exec_q.submit(
@@ -188,6 +191,81 @@ sycl::event compute_pw_dist_opt(
                     }
                 };
                 cgh.parallel_for<class kern_pwdist>(ndRange, kern_func);
+            });
+
+    return ev;
+}
+
+template <typename floatT, int n_train_chunk = 32, int n_test_chunk = 4>
+sycl::event compute_pw_dist_opt2(
+    sycl::queue &exec_q,
+    size_t dim,
+    sycl::buffer<floatT, 1> &X_train_buf,
+    size_t n_train,
+    sycl::buffer<floatT, 1> &X_test_buf,
+    size_t n_test,
+    sycl::buffer<floatT, 2> &dist_buf,
+    const sycl::event &prev_iter_dep,
+    const sycl::vector_class<sycl::event> depends = {})
+{
+    static_assert(0 == (n_test_chunk & (n_test_chunk - 1)));
+    static_assert(0 == (n_train_chunk & (n_train_chunk - 1)));
+
+    static_assert(n_test_chunk > 0);
+    static_assert(n_train_chunk > 0);
+
+    sycl::event ev =
+        exec_q.submit(
+            [&](sycl::handler &cgh)
+            {
+                cgh.depends_on(depends);
+                cgh.depends_on(prev_iter_dep);
+                sycl::accessor<floatT, 2, sycl::access::mode::read_write, sycl::access::target::local>
+                    slm_test(sycl::range<2>(n_test_chunk, dim), cgh);
+                sycl::accessor dist_acc(dist_buf, cgh, sycl::read_write);
+                sycl::accessor X_train_acc(X_train_buf, cgh, sycl::read_only);
+                sycl::accessor X_test_acc(X_test_buf, cgh, sycl::read_only);
+
+                auto ndRange = sycl::nd_range<2>(
+                    sycl::range<2>(
+                        n_train_chunk * ceiling_quotient(n_train, static_cast<size_t>(n_train_chunk)),
+                        n_test_chunk * ceiling_quotient(n_test, static_cast<size_t>(n_test_chunk))),
+                    sycl::range<2>(n_train_chunk, n_test_chunk));
+                auto kern_func = [=](sycl::nd_item<2> it)
+                {
+                    auto i_train = it.get_global_id(0);
+                    auto lid_train = it.get_local_id(0);
+                    auto i_test = it.get_global_id(1);
+                    auto lid_test = it.get_local_id(1);
+
+                    if (lid_train == 0)
+                    {
+                        for (size_t elem_id = 0; elem_id < dim; ++elem_id)
+                        {
+                            slm_test[sycl::id<2>(lid_test, elem_id)] = X_test_acc[i_test * dim + elem_id];
+                        }
+                    }
+                    it.barrier(sycl::access::fence_space::local_space);
+
+                    if ((i_train < n_train) && (i_test < n_test))
+                    {
+                        floatT sum_sq(0);
+                        for (size_t k = 0; k < dim; k += 4)
+                        {
+                            sycl::vec<floatT, 4> train_v, test_v;
+                            train_v.load(0, X_train_acc.get_pointer() + i_train * dim + k);
+                            test_v.load(0, slm_test.get_pointer() + lid_test * dim + k);
+                            const auto diff = train_v - test_v;
+                            auto diff_sq = diff * diff;
+                            sum_sq += diff_sq[0] +
+                                      ((k + 1 < dim) ? diff_sq[1] : floatT(0)) +
+                                      ((k + 2 < dim) ? diff_sq[2] : floatT(0)) +
+                                      ((k + 3 < dim) ? diff_sq[3] : floatT(0));
+                        }
+                        dist_acc[sycl::id<2>(i_test, i_train)] = sum_sq;
+                    }
+                };
+                cgh.parallel_for<class kern_pwdist2>(ndRange, kern_func);
             });
 
     return ev;
@@ -289,13 +367,16 @@ void parallel_knn_search(
                     cgh.fill<floatT>(dist_acc, floatT(0));
                 });
 
-            sycl::event pw_dist_ev = compute_pw_dist_opt<floatT>(
+            sycl::event pw_dist_ev = compute_pw_dist_opt2<floatT>(
                 exec_q, dim,
                 X_train_chunk_buf, n_train,
                 X_test_chunk_buf, n_test,
                 dist_buf, prev_iter_dep, depends);
 
             size_t m = compute_n_heaps_per_test(n_train, 16 * k);
+            size_t n_trains_per_heap = ceiling_quotient(n_train, m);
+
+            // std::cout << "Looping over " << n_train << " distances, using " << m << " heaps to accumulate " << k << " points." << std::endl;
             sycl::event topk_ev = exec_q.submit(
                 [&](sycl::handler &cgh)
                 {
@@ -309,31 +390,35 @@ void parallel_knn_search(
                             auto heap_id = it.get_id(0);
                             auto test_id = it.get_id(1);
 
-                            for (size_t i_train = heap_id; i_train < n_train; i_train += m)
+                            // proxy to represent view with fixed index 0, and index 1.
+                            HeapProxy3D<decltype(max_heap_acc)> heap(max_heap_acc, test_id, heap_id);
+
+                            for (size_t i_train = heap_id * n_trains_per_heap; i_train < (heap_id + 1) * n_trains_per_heap; i_train += 4)
                             {
-                                const pair_t top = max_heap_acc[sycl::id<3>(test_id, heap_id, 0)];
-                                const floatT dist_itrain_to_testid = dist_acc[sycl::id<2>(test_id, i_train)];
-                                if (dist_itrain_to_testid < top.get_distance())
+                                sycl::vec<floatT, 4> dists;
+                                dists.load(0, dist_acc.get_pointer() + test_id * train_chunk_size + i_train);
+                                for (int i = 0; i < 4 && i_train + i < n_train; ++i)
                                 {
-                                    pair_t cand;
-                                    size_t abs_i_train = n_train_disp + i_train;
-                                    cand.set(dist_itrain_to_testid, abs_i_train);
-
-                                    // proxy to represent view with fixed index 0, and index 1.
-                                    HeapProxy3D<decltype(max_heap_acc)> heap(max_heap_acc, test_id, heap_id);
-
-                                    const auto device_comp = [](pair_t p1, pair_t p2)
+                                    const floatT dist_itrain_to_testid = dists[i];
+                                    if (dist_itrain_to_testid < heap[0].get_distance())
                                     {
-                                        return p1.get_distance() < p2.get_distance();
-                                    };
+                                        pair_t cand;
+                                        size_t abs_i_train = n_train_disp + i_train + i;
+                                        cand.set(dist_itrain_to_testid, abs_i_train);
 
-                                    // no synchronization is needed, since workitems
-                                    // work on disjoint blocks of memory
-                                    pop_heap<decltype(heap), pair_t, decltype(device_comp)>(
-                                        heap, k, device_comp);
-                                    heap[k - 1] = cand;
-                                    push_heap<decltype(heap), pair_t, decltype(device_comp)>(
-                                        heap, k, device_comp);
+                                        const auto device_comp = [](pair_t p1, pair_t p2)
+                                        {
+                                            return p1.get_distance() < p2.get_distance();
+                                        };
+
+                                        // no synchronization is needed, since workitems
+                                        // work on disjoint blocks of memory
+                                        pop_heap<decltype(heap), pair_t, decltype(device_comp)>(
+                                            heap, k, device_comp);
+                                        heap[k - 1] = cand;
+                                        push_heap<decltype(heap), pair_t, decltype(device_comp)>(
+                                            heap, k, device_comp);
+                                    }
                                 }
                             }
                         });
@@ -352,7 +437,7 @@ void parallel_knn_search(
                     sycl::accessor max_heap_acc(max_heap_buf, cgh, sycl::read_only);
                     sycl::accessor aggregation_heap_acc(aggregation_heap_buf, cgh);
 
-                    cgh.parallel_for<class aggreg_kern>(
+                    cgh.parallel_for<class kern_aggregate>(
                         n_test,
                         [=](sycl::id<1> idx)
                         {

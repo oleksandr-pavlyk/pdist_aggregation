@@ -39,6 +39,17 @@ int main(void)
     double *knn_dists = new double[n_test * k];
     long long *knn_ind = new long long[n_test * k];
 
+#if 0
+    sycl::vector_class<sycl::kernel_id> kernel_ids_vec = {
+	sycl::get_kernel_id<kern_topk>(),
+	sycl::get_kernel_id<kern_pwdist>(),
+	sycl::get_kernel_id<kern_init_max_heap>(),
+	sycl::get_kernel_id<kern_init_aggregation_heap>()
+    };
+
+    auto kb = sycl::get_kernel_bundle<sycl::bundle_state::executable>(q.get_context(), kernel_ids_vec);
+#endif
+
     auto t0 = std::chrono::steady_clock::now();
     parallel_knn_search<double, long long>(q, k, dim, X_train_host, n_train, X_test_host, n_test, knn_ind, knn_dists, {});
     q.wait();
