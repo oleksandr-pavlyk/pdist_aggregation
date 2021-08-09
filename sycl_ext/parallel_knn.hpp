@@ -56,10 +56,28 @@ inline T ceiling_quotient(T n, T m)
     return ((n + m - 1) / m);
 }
 
+template <typename intT>
+inline intT int_sqrt(intT n)
+{
+    assert(n > 0);
+    intT x(n >> 1);
+    intT y, delta;
+
+    do
+    {
+        intT d = n / x;
+        y = (x + d) >> 1;
+        delta = (y > x) ? y - x : x - y;
+        x = y;
+    } while (delta > 1);
+
+    return std::min<intT>(x, y);
+}
+
 class kern_init_aggregation_heap;
 class kern_init_max_heap;
 class kern_pwdist;
-class topk_kern;
+class kern_topk;
 
 template <typename floatT, int dim_chunk = 2, int n_train_chunk = 16, int n_test_chunk = 8>
 sycl::event compute_pw_dist_opt(
@@ -194,11 +212,15 @@ void parallel_knn_search(
         return p1.get_distance() < p2.get_distance();
     };
 
-    const size_t train_chunk_size = std::min(n_train_, std::max(k, size_t(16536)));
-    const size_t test_chunk_size = std::max(n_test_, size_t(512));
+    const size_t train_chunk_size = std::min(n_train_, std::max(k, size_t(16384)));
+    const size_t test_chunk_size = std::min(n_test_, size_t(512));
 
-    sycl::buffer<floatT, 2> dist_buf(
-        sycl::range<2>(test_chunk_size, train_chunk_size));
+    const size_t max_op = 7 * 8 * exec_q.get_device().get_info<sycl::info::device::max_compute_units>();
+    const size_t optimal_heaps_per_test = ceiling_quotient(2 * max_op, test_chunk_size);
+
+    sycl::buffer<floatT, 2>
+        dist_buf(
+            sycl::range<2>(test_chunk_size, train_chunk_size));
     sycl::buffer<pair_t, 2> aggregation_heap_buf(sycl::range<2>(test_chunk_size, k));
 
     const size_t n_train_chunks = ceiling_quotient(n_train_, train_chunk_size);
@@ -209,7 +231,12 @@ void parallel_knn_search(
 
     // to find nearest neighbors, (n_test, n_heaps_per_test) heaps are maintained,
     // each heap is built by a work-item, based on (n_train / m) distances
-    size_t n_heaps_per_test = std::min(size_t(16), ceiling_quotient(train_chunk_size, 16 * k));
+    // size_t n_heaps_per_test = std::min(size_t(16), ceiling_quotient(train_chunk_size, 16 * k));
+    auto compute_n_heaps_per_test = [=](size_t n, size_t k) -> size_t
+    {
+        return std::min(optimal_heaps_per_test, ceiling_quotient(int_sqrt(n), k));
+    };
+    size_t n_heaps_per_test = compute_n_heaps_per_test(train_chunk_size, k);
     sycl::buffer<pair_t, 3> max_heap_buf(sycl::range<3>(n_test_, n_heaps_per_test, k));
 
     for (size_t n_test_chunk_id = 0; n_test_chunk_id < n_test_chunks; ++n_test_chunk_id)
@@ -268,35 +295,37 @@ void parallel_knn_search(
                 X_test_chunk_buf, n_test,
                 dist_buf, prev_iter_dep, depends);
 
-            size_t m = std::min(size_t(16), ceiling_quotient(n_train, 16 * k));
+            size_t m = compute_n_heaps_per_test(n_train, 16 * k);
             sycl::event topk_ev = exec_q.submit(
                 [&](sycl::handler &cgh)
                 {
                     cgh.depends_on(pw_dist_ev);
                     sycl::accessor max_heap_acc(max_heap_buf, cgh);
                     sycl::accessor dist_acc(dist_buf, cgh, sycl::read_only);
-                    cgh.parallel_for<topk_kern>(
+                    cgh.parallel_for<kern_topk>(
                         sycl::range<2>(m, n_test),
                         [=](sycl::item<2> it)
                         {
                             auto heap_id = it.get_id(0);
                             auto test_id = it.get_id(1);
-                            const auto device_comp = [](pair_t p1, pair_t p2)
-                            {
-                                return p1.get_distance() < p2.get_distance();
-                            };
 
                             for (size_t i_train = heap_id; i_train < n_train; i_train += m)
                             {
-                                pair_t top = max_heap_acc[sycl::id<3>(test_id, heap_id, 0)];
-                                pair_t cand;
-                                size_t abs_i_train = n_train_disp + i_train;
-                                floatT dist_itrain_to_testid = dist_acc[sycl::id<2>(test_id, i_train)];
-                                cand.set(dist_itrain_to_testid, abs_i_train);
-                                if (device_comp(cand, top))
+                                const pair_t top = max_heap_acc[sycl::id<3>(test_id, heap_id, 0)];
+                                const floatT dist_itrain_to_testid = dist_acc[sycl::id<2>(test_id, i_train)];
+                                if (dist_itrain_to_testid < top.get_distance())
                                 {
+                                    pair_t cand;
+                                    size_t abs_i_train = n_train_disp + i_train;
+                                    cand.set(dist_itrain_to_testid, abs_i_train);
+
                                     // proxy to represent view with fixed index 0, and index 1.
                                     HeapProxy3D<decltype(max_heap_acc)> heap(max_heap_acc, test_id, heap_id);
+
+                                    const auto device_comp = [](pair_t p1, pair_t p2)
+                                    {
+                                        return p1.get_distance() < p2.get_distance();
+                                    };
 
                                     // no synchronization is needed, since workitems
                                     // work on disjoint blocks of memory
@@ -315,30 +344,52 @@ void parallel_knn_search(
 
         // we now have m heaps, for the each test point in the chunk
         // we aggregate these heaps into aggregation heap on the host.
+
+        sycl::event aggreg_ev =
+            exec_q.submit(
+                [&](sycl::handler &cgh)
+                {
+                    sycl::accessor max_heap_acc(max_heap_buf, cgh, sycl::read_only);
+                    sycl::accessor aggregation_heap_acc(aggregation_heap_buf, cgh);
+
+                    cgh.parallel_for<class aggreg_kern>(
+                        n_test,
+                        [=](sycl::id<1> idx)
+                        {
+                            auto i_test = idx[0];
+                            HeapProxy2D<decltype(aggregation_heap_acc)> res_heap(aggregation_heap_acc, i_test);
+                            const auto device_comp = [](pair_t p1, pair_t p2)
+                            {
+                                return p1.get_distance() < p2.get_distance();
+                            };
+
+                            for (size_t heap_chunk_id = 0; heap_chunk_id < n_heaps_per_test; ++heap_chunk_id)
+                            {
+                                for (size_t heap_elem_id = 0; heap_elem_id < k; ++heap_elem_id)
+                                {
+                                    pair_t top = res_heap[0];
+                                    pair_t cand = max_heap_acc[sycl::id<3>(i_test, heap_chunk_id, heap_elem_id)];
+                                    if (device_comp(cand, top))
+                                    {
+                                        pop_heap<decltype(res_heap), pair_t, decltype(device_comp)>(
+                                            res_heap, k, device_comp);
+                                        res_heap[k - 1] = cand;
+                                        push_heap<decltype(res_heap), pair_t, decltype(device_comp)>(
+                                            res_heap, k, device_comp);
+                                    }
+                                }
+                            }
+                        });
+                });
+
         {
-            sycl::host_accessor max_heap_hacc(max_heap_buf, sycl::read_only);
             sycl::host_accessor aggregation_heap_hacc(aggregation_heap_buf);
 
             for (size_t i_test = 0; i_test < n_test; ++i_test)
             {
                 HeapProxy2D<decltype(aggregation_heap_hacc)> res_heap(aggregation_heap_hacc, i_test);
-                for (size_t heap_chunk_id = 0; heap_chunk_id < n_heaps_per_test; ++heap_chunk_id)
-                {
-                    for (size_t heap_elem_id = 0; heap_elem_id < k; ++heap_elem_id)
-                    {
-                        pair_t top = res_heap[0];
-                        pair_t cand = max_heap_hacc[sycl::id<3>(i_test, heap_chunk_id, heap_elem_id)];
-                        if (host_comp(cand, top))
-                        {
-                            pop_heap<decltype(res_heap), pair_t, decltype(host_comp)>(
-                                res_heap, k, host_comp);
-                            res_heap[k - 1] = cand;
-                            push_heap<decltype(res_heap), pair_t, decltype(host_comp)>(
-                                res_heap, k, host_comp);
-                        }
-                    }
-                }
                 size_t abs_i_test = n_test_disp + i_test;
+
                 sort_heap<decltype(res_heap), pair_t, decltype(host_comp)>(res_heap, k, host_comp);
                 // res_heap is now sorted, from least distance to k-th largest one
                 floatT prev = -std::numeric_limits<floatT>::infinity();
