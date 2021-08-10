@@ -18,6 +18,7 @@ int main(void)
     size_t n_train = 1024 * 1024;
     size_t dim = 5;
     size_t n_test = 273;
+    size_t k = 5;
 
     double *X_train_host = new double[n_train * dim];
     double *X_test_host = new double[n_train * dim];
@@ -35,7 +36,6 @@ int main(void)
             X_test_host[i] = dis(gen);
         }
     }
-    size_t k = 5;
     double *knn_dists = new double[n_test * k];
     long long *knn_ind = new long long[n_test * k];
 
