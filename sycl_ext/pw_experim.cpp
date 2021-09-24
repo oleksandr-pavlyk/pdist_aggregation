@@ -275,8 +275,8 @@ sycl::event pw_dsq_host2(
     size_t ld_dm,
     const sycl::vector_class<sycl::event> &depends = {})
 {
-    constexpr int n_train_chunk = 8;
-    constexpr int n_test_chunk = 32;
+    constexpr int n_train_chunk = 32;
+    constexpr int n_test_chunk = 4;
 
     sycl::buffer<floatT, 1> X_train_buf(X_train_host_ptr, sycl::range<1>(n_train * dim));
     sycl::buffer<floatT, 1> X_test_buf(X_test_host_ptr, sycl::range<1>(n_test * dim));
@@ -295,23 +295,31 @@ sycl::event pw_dsq_host2(
 
                 auto ndRange = sycl::nd_range<2>(
                     sycl::range<2>(
-                        n_train_chunk * ceiling_quotient(n_train, static_cast<size_t>(n_train_chunk)),
-                        n_test_chunk * ceiling_quotient(n_test, static_cast<size_t>(n_test_chunk))),
-                    sycl::range<2>(n_train_chunk, n_test_chunk));
+                        n_test_chunk * ceiling_quotient(n_test, static_cast<size_t>(n_test_chunk)),
+                        n_train_chunk * ceiling_quotient(n_train, static_cast<size_t>(n_train_chunk))),
+                    sycl::range<2>(n_test_chunk, n_train_chunk));
                 auto kern_func = [=](sycl::nd_item<2> it)
                 {
-                    auto i_train = it.get_global_id(0);
-                    auto lid_train = it.get_local_id(0);
-                    auto i_test = it.get_global_id(1);
-                    auto lid_test = it.get_local_id(1);
+                    auto i_test = it.get_global_id(0);
+                    auto lid_test = it.get_local_id(0);
+                    auto i_train = it.get_global_id(1);
+                    auto lid_train = it.get_local_id(1);
 
+#if 0
+                    auto train_wg_size = it.get_local_range(1);
+                    for (size_t elem_id = lid_train; elem_id < dim; elem_id += train_wg_size)
+                    {
+                        slm_test[sycl::id<2>(lid_test, elem_id)] = X_test_acc[i_test * dim + elem_id];
+                    }
+#else
                     if (lid_train == 0)
                     {
-                        for (size_t elem_id = 0; elem_id < dim; ++elem_id)
+                        for (size_t elem_id = 0; elem_id < dim; elem_id += 1)
                         {
                             slm_test[sycl::id<2>(lid_test, elem_id)] = X_test_acc[i_test * dim + elem_id];
                         }
                     }
+#endif
                     it.barrier(sycl::access::fence_space::local_space);
 
                     if ((i_train < n_train) && (i_test < n_test))

@@ -230,24 +230,28 @@ sycl::event compute_pw_dist_opt2(
                 sycl::accessor X_train_acc(X_train_buf, cgh, sycl::read_only);
                 sycl::accessor X_test_acc(X_test_buf, cgh, sycl::read_only);
 
-                auto ndRange = sycl::nd_range<2>(
-                    sycl::range<2>(
-                        n_test_chunk * ceiling_quotient(n_test, static_cast<size_t>(n_test_chunk)),
-                        n_train_chunk * ceiling_quotient(n_train, static_cast<size_t>(n_train_chunk))),
-                    sycl::range<2>(n_test_chunk, n_train_chunk));
+                auto gws = sycl::range<2>(
+                    n_test_chunk * ceiling_quotient(n_test, static_cast<size_t>(n_test_chunk)),
+                    n_train_chunk * ceiling_quotient(n_train, static_cast<size_t>(n_train_chunk)));
+                auto lws = sycl::range<2>(n_test_chunk, n_train_chunk);
+                auto ndRange = sycl::nd_range<2>(gws, lws);
 
                 auto kern_func = [=](sycl::nd_item<2> it)
                 {
                     auto i_train = it.get_global_id(1);
                     auto lid_train = it.get_local_id(1);
+
                     auto i_test = it.get_global_id(0);
                     auto lid_test = it.get_local_id(0);
-                    auto lid_train_max = it.get_local_range(1);
 
 #if 1
-                    for (size_t elem_id = lid_train; elem_id < dim; elem_id += lid_train_max)
+                    if (i_test < n_test && lid_train < dim)
                     {
-                        slm_test[sycl::id<2>(lid_test, elem_id)] = X_test_acc[i_test * dim + elem_id];
+                        auto lid_train_max = it.get_local_range(1);
+                        for (size_t elem_id = lid_train; elem_id < dim; elem_id += lid_train_max)
+                        {
+                            slm_test[sycl::id<2>(lid_test, elem_id)] = X_test_acc[i_test * dim + elem_id];
+                        }
                     }
 #else
                     auto lid_test_max = it.get_local_range(1);

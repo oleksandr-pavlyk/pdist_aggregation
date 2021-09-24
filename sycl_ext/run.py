@@ -1,9 +1,10 @@
 import numpy as np, dpctl, nn
 from timeit import default_timer
 
-np.random.seed(1234)
-X_train = np.random.randn(1024*1024, 5)
-X_test = np.random.randn(273, 5)
+# np.random.seed(124)
+dim = 7
+X_train = np.random.randn(200*1024, dim)
+X_test = np.random.randn(273, dim)
 
 k = 5
 print("Solving KNN problem:")
@@ -35,14 +36,18 @@ t2 = default_timer()
 ind_cpu = knn_gpu.kneighbors(X_test)
 t3 = default_timer()
 
-assert np.array_equal(ind_ref, ind_gpu), "SYCL result computed on GPU disagrees with reference"
-assert np.array_equal(ind_ref, ind_cpu), "SYCL result computed on GPU disagrees with reference"
-
-print("SYCL computed indexes agreed with reference computed indexes")
-
 print("Reference result computation took {} seconds".format(t1-t0))
 print("SYCL algo on GPU computation took {} seconds".format(t2-t1))
 print("SYCL algo on CPU computation took {} seconds".format(t3-t2))
+
+assert np.array_equal(ind_ref, ind_gpu), (
+    f"SYCL result computed on GPU disagrees with reference, {np.sum(ind_ref == ind_gpu)}"
+    )
+assert np.array_equal(ind_ref, ind_cpu), (
+    f"SYCL result computed on GPU disagrees with reference, {np.sum(ind_ref == ind_cpu)}"
+)
+print("SYCL computed indexes agreed with reference computed indexes")
+
 
 
 print("")

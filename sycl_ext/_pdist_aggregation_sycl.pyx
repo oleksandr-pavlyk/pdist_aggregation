@@ -17,6 +17,13 @@ cdef extern from "parallel_knn_helper.hpp":
         floatT *knn_distance_ptr
     ) nogil
 
+    void pw_d2m[floatT](
+        c_dpctl.DPCTLSyclQueueRef q,
+        size_t dim,
+        floatT* X_train_ptr, size_t n_train,
+        floatT* X_test_ptr, size_t n_test,
+        floatT* dsq
+        ) nogil
 
 def parallel_knn(
         const double[:, ::1] X_train,
@@ -46,10 +53,11 @@ def parallel_knn(
 
     if (X_train.shape[1] != X_test.shape[1]):
         raise ValueError("Dimensionality of test and train datasets must be the same")
+
     dim = X_train.shape[1]
 
     if (queue is None):
-        queue = dpctl.SyclQueue() # use default
+        queue = dpctl.SyclQueue()  # use default
 
     QRef = queue.get_queue_ref()
     p_knn_search[double, Py_ssize_t](
@@ -59,5 +67,33 @@ def parallel_knn(
         &knn_indices[0,0],
         &knn_distances[0,0]
     )
-
     return (np.asarray(knn_indices), np.asarray(knn_distances)) if return_distance else np.asarray(knn_indices)
+
+
+def distance_squared_matrix(
+        const double[:, ::1] X_train,
+        const double[:, ::1] X_test,
+        c_dpctl.SyclQueue queue
+):
+    float_dtype = np.double
+    cdef:
+        size_t dim = 0
+        size_t n_train = X_train.shape[0]
+        size_t n_test = X_test.shape[0]
+        c_dpctl.DPCTLSyclQueueRef QRef = NULL
+        double[:, ::1] d2m = np.full((X_test.shape[0], X_train.shape[0]),
+                                     np.inf,
+                                     dtype=float_dtype)
+    if (X_train.shape[1] != X_test.shape[1]):
+        raise ValueError("Dimensionality of test and train datasets must be the same")
+
+    dim = X_train.shape[1]
+
+    if (queue is None):
+        queue = dpctl.SyclQueue()  # use default
+
+    QRef = queue.get_queue_ref()
+    pw_d2m[double](
+        QRef, dim, &X_train[0,0], n_train, &X_test[0,0], n_test, &d2m[0,0])
+
+    return np.asarray(d2m)
